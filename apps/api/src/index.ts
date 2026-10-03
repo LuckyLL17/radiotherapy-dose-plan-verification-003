@@ -17,9 +17,116 @@ function releaseDossier(planId:string){const plan=plans.find(p=>p.id===planId);i
 app.get('/api/plans/:id/verification-dossier',async req=>releaseDossier((req.params as {id:string}).id));
 app.post('/api/plans/:id/independent-check',async req=>{const id=(req.params as {id:string}).id;const body=(req.body??{}) as {method?:'independent_mu'|'gamma'|'image_guidance';score?:number};const method=body.method??'independent_mu';const score=body.score??(method==='gamma'?97.1:2.2);const status=method==='gamma'?(score>=95?'pass':score>=90?'warn':'fail'):(score<=3?'pass':score<=5?'warn':'fail');const run:QaRun={id:`QA-${String(qaRuns.length+71).padStart(3,'0')}`,planId:id,method,status,score,detail:method==='gamma'?`γ 通过率 ${score}%`:`独立 MU 差异 ${score}%`,createdAt:new Date().toISOString()};qaRuns.unshift(run);audits.unshift({at:run.createdAt,action:'independent_check',...run});return run});
 app.post('/api/plans/:id/peer-checklist',async req=>{const id=(req.params as {id:string}).id;const body=req.body as {item:string;checked:boolean;reviewer:string};const list=peerChecklist.get(id)??[];const existing=list.find(x=>x.item===body.item);if(existing){existing.checked=body.checked;existing.reviewer=body.reviewer;existing.at=new Date().toISOString()}else list.push({...body,at:new Date().toISOString()});peerChecklist.set(id,list);audits.unshift({at:new Date().toISOString(),action:'peer_checklist',planId:id,...body});return {planId:id,items:list}});
-app.post('/api/plans/:id/adaptive-evaluation',async req=>{const id=(req.params as {id:string}).id;const body=(req.body??{}) as {weightChange?:number;tumorShift?:number;lungDensityChange?:number};const shift=Math.abs(body.tumorShift??0);const weight=Math.abs(body.weightChange??0);const density=Math.abs(body.lungDensityChange??0);const coverage=+(96.4-shift*.7-weight*.18).toFixed(2);const lungV20=+(21.3+density*.8+shift*.12).toFixed(2);const recommendation=coverage<95||lungV20>25?'需要自适应重计划评估':'可按原计划继续治疗';const event={id:`ADP-${Date.now()}`,planId:id,coverage,lungV20,anatomyChange:{weight,shift,density},recommendation,createdAt:new Date().toISOString()};audits.unshift({at:event.createdAt,action:'adaptive_evaluation',...event});return event});
 app.post('/api/plans/:id/delivery/fractions',async req=>{const id=(req.params as {id:string}).id;const body=req.body as {fraction:number;deliveredGy:number;setupShift:{x:number;y:number;z:number}};const list=deliveries.get(id)??[];if(list.some(x=>x.fraction===body.fraction))return {ok:false,error:'duplicate_fraction'};list.push({...body,at:new Date().toISOString()});deliveries.set(id,list);const magnitude=Math.hypot(body.setupShift.x,body.setupShift.y,body.setupShift.z);if(magnitude>5)deviations.unshift({id:`DEV-${deviations.length+1}`,planId:id,severity:'high',category:'setup_shift',detail:`第 ${body.fraction} 次摆位偏移 ${magnitude.toFixed(1)} mm`,state:'open',createdAt:new Date().toISOString()});audits.unshift({at:new Date().toISOString(),action:'fraction_delivered',planId:id,fraction:body.fraction});return releaseDossier(id)});
 app.post('/api/plans/:id/release',async req=>{const id=(req.params as {id:string}).id;const dossier=releaseDossier(id);if('error' in dossier)return dossier;if(dossier.gate==='blocked')return {released:false,...dossier};const plan=plans.find(p=>p.id===id)!;plan.status='approved';audits.unshift({at:new Date().toISOString(),action:'plan_released',planId:id});return {released:true,...releaseDossier(id)}});
 app.post('/api/plans/:id/deviations',async req=>{const id=(req.params as {id:string}).id;const body=req.body as {severity:'low'|'medium'|'high';category:string;detail:string};const event={id:`DEV-${deviations.length+1}`,planId:id,...body,state:'open' as const,createdAt:new Date().toISOString()};deviations.unshift(event);return event});
+
+// ───────────────────────── 自适应评估模块（独立、append-only） ─────────────────────────
+type AdaptiveInput={weightChange:number;tumorShift:number;lungDensityChange:number;note?:string};
+type AdaptiveRecommendation='continue'|'review'|'replan';
+type AdaptiveRecord={id:string;planId:string;inputs:AdaptiveInput;targetCoverage:number;lungV20:number;thresholds:{coverageFailBelow:number;coverageWarnBelow:number;lungV20FailAbove:number;lungV20WarnAbove:number};warnings:string[];recommendation:AdaptiveRecommendation;recommendationText:string;reasons:string[];createdAt:string};
+// 历史仅追加，永不覆盖；同一计划的评估聚在同一数组
+const adaptiveHistory:AdaptiveRecord[]=[];
+// 各计划治疗中基线（首周 CBCT/计划剂量复核值）
+const adaptiveBaseline:Record<string,{coverage:number;lungV20:number}>={
+  'PLAN-A':{coverage:metrics(plans[0])[0].value,lungV20:metrics(plans[0])[1].value},
+  'PLAN-B':{coverage:metrics(plans[1])[0].value,lungV20:metrics(plans[1])[1].value}
+};
+// 判定阈值（临界值含等号：95.00% 与 25.00% 视为通过）
+const ADAPTIVE_COVERAGE_FALLBACK=96.4;
+const ADAPTIVE_V20_FALLBACK=21.3;
+const COVERAGE_FAIL_BELOW=95;     // D95 覆盖 < 95% → 重计划
+const COVERAGE_WARN_BELOW=96;     // 95% ≤ D95 < 96% → 临界复核
+const LUNGV20_FAIL_ABOVE=25;      // V20 > 25% → 重计划
+const LUNGV20_WARN_ABOVE=24;      // 24% < V20 ≤ 25% → 临界复核
+// 服务端防重复提交：同一计划、输入完全一致的时间窗（毫秒）
+const ADAPTIVE_DEDUP_WINDOW_MS=30_000;
+
+function round2(v:number){return Math.round(v*100)/100;}
+function clampPct(v:number){return Math.min(100,Math.max(0,round2(v)));}
+// 仅接受 number 或数字字符串；null/undefined/布尔/NaN/Infinity/空串均拒绝
+function toFiniteNumber(v:unknown):number|null{
+  if(typeof v==='boolean')return null;
+  if(typeof v==='number')return Number.isFinite(v)?v:null;
+  if(typeof v==='string'){const t=v.trim();if(t==='')return null;const n=Number(t);return Number.isFinite(n)?n:null;}
+  return null;
+}
+function validateAdaptiveInput(body:any):{input:AdaptiveInput|null;errors:string[]}{
+  const errors:string[]=[];
+  const read=(field:'weightChange'|'tumorShift'|'lungDensityChange',label:string,min:number,max:number,nonNegative:boolean)=>{
+    if(body===null||typeof body!=='object'||!(field in body)){errors.push(`${label}不能为空`);return null;}
+    const n=toFiniteNumber(body[field]);
+    if(n===null){errors.push(`${label}必须是有效数字`);return null;}
+    if(n<0&&nonNegative){errors.push(`${label}不能为负值`);return null;}
+    if(n<min||n>max){errors.push(`${label}取值需在 ${min} ~ ${max} 之间`);return null;}
+    return round2(n);
+  };
+  const weightChange=read('weightChange','体重变化(kg)',-30,30,false);
+  const tumorShift=read('tumorShift','肿瘤位移(mm)',0,50,true);
+  const lungDensityChange=read('lungDensityChange','肺部密度变化(HU)',-500,500,false);
+  let note:string|undefined;
+  if(body!==null&&typeof body==='object'&&'note' in body&&body.note!=null){
+    if(typeof body.note!=='string'){errors.push('备注必须是文本');}
+    else{note=body.note.trim().slice(0,200);}
+  }
+  if(errors.length)return {input:null,errors};
+  return {input:{weightChange:weightChange as number,tumorShift:tumorShift as number,lungDensityChange:lungDensityChange as number,...(note?{note}:{})},errors};
+}
+// 服务端计算：覆盖下降源于肿瘤移位与体重下降；V20 上升源于肺密度增加与移位
+function computeAdaptive(planId:string,input:AdaptiveInput){
+  const base=adaptiveBaseline[planId]??{coverage:ADAPTIVE_COVERAGE_FALLBACK,lungV20:ADAPTIVE_V20_FALLBACK};
+  const weightLoss=Math.min(0,input.weightChange); // 减重（负值）拉低覆盖
+  const targetCoverage=clampPct(base.coverage-input.tumorShift*0.7+weightLoss*0.18);
+  const lungV20=clampPct(base.lungV20+input.lungDensityChange*0.02+input.tumorShift*0.12);
+  const warnings:string[]=[];
+  const reasons:string[]=[];
+  // 所有比较都基于 round2 后的值，避免浮点误差导致 95/25 临界误判
+  if(targetCoverage>=COVERAGE_WARN_BELOW&&targetCoverage<COVERAGE_WARN_BELOW+0.5)warnings.push(`靶区覆盖 ${targetCoverage}% 接近复核临界 ${COVERAGE_WARN_BELOW}%`);
+  if(lungV20>LUNGV20_WARN_ABOVE-0.5&&lungV20<=LUNGV20_WARN_ABOVE)warnings.push(`肺部 V20 ${lungV20}% 接近复核临界 ${LUNGV20_WARN_ABOVE}%`);
+  const coverageFail=targetCoverage<COVERAGE_FAIL_BELOW;
+  const coverageWarn=!coverageFail&&targetCoverage<COVERAGE_WARN_BELOW;
+  const lungFail=lungV20>LUNGV20_FAIL_ABOVE;
+  const lungWarn=!lungFail&&lungV20>LUNGV20_WARN_ABOVE;
+  if(coverageFail)reasons.push(`靶区 D95 覆盖 ${targetCoverage}% 低于 ${COVERAGE_FAIL_BELOW}%`);
+  if(lungFail)reasons.push(`肺部 V20 ${lungV20}% 高于 ${LUNGV20_FAIL_ABOVE}%`);
+  if(coverageWarn)reasons.push(`靶区 D95 覆盖 ${targetCoverage}% 低于复核临界 ${COVERAGE_WARN_BELOW}%（未跌破 ${COVERAGE_FAIL_BELOW}%）`);
+  if(lungWarn)reasons.push(`肺部 V20 ${lungV20}% 高于复核临界 ${LUNGV20_WARN_ABOVE}%（未超过 ${LUNGV20_FAIL_ABOVE}%）`);
+  let recommendation:AdaptiveRecommendation;
+  if(coverageFail||lungFail)recommendation='replan';
+  else if(coverageWarn||lungWarn)recommendation='review';
+  else recommendation='continue';
+  if(!coverageFail&&!coverageWarn)reasons.push(`靶区 D95 覆盖 ${targetCoverage}% ≥ ${COVERAGE_WARN_BELOW}%`);
+  if(!lungFail&&!lungWarn)reasons.push(`肺部 V20 ${lungV20}% ≤ ${LUNGV20_WARN_ABOVE}%`);
+  const recommendationText=recommendation==='replan'?'需要自适应重计划评估':recommendation==='review'?'建议尽快复核（临界指标）':'可按原计划继续治疗';
+  return {targetCoverage,lungV20,warnings,recommendation,recommendationText,reasons};
+}
+// 读取同一计划的评估历史（最新在前），绝不返回其他计划的数据
+app.get('/api/plans/:id/adaptive-assessments',async (req,reply)=>{
+  const id=(req.params as {id:string}).id;
+  if(!plans.some(p=>p.id===id))return reply.code(404).send({error:'plan_not_found',message:'计划不存在'});
+  const history=adaptiveHistory.filter(a=>a.planId===id);
+  return {planId:id,thresholds:{coverageFailBelow:COVERAGE_FAIL_BELOW,coverageWarnBelow:COVERAGE_WARN_BELOW,lungV20FailAbove:LUNGV20_FAIL_ABOVE,lungV20WarnAbove:LUNGV20_WARN_ABOVE},baseline:adaptiveBaseline[id]??null,history};
+});
+// 录入一次变化并由服务端计算结论；append-only，不覆盖任何旧记录
+app.post('/api/plans/:id/adaptive-assessments',async (req,reply)=>{
+  const id=(req.params as {id:string}).id;
+  if(!plans.some(p=>p.id===id))return reply.code(404).send({error:'plan_not_found',message:'计划不存在'});
+  const parsed=validateAdaptiveInput(req.body);
+  if(parsed.input===null)return reply.code(400).send({error:'validation_failed',message:'输入校验未通过',errors:parsed.errors});
+  const {input}=parsed;
+  // 服务端防重复提交：时间窗内相同输入直接返回既有记录，不新增
+  const now=Date.now();
+  const duplicate=adaptiveHistory.find(a=>a.planId===id
+    &&a.inputs.weightChange===input.weightChange
+    &&a.inputs.tumorShift===input.tumorShift
+    &&a.inputs.lungDensityChange===input.lungDensityChange
+    &&now-Date.parse(a.createdAt)<=ADAPTIVE_DEDUP_WINDOW_MS);
+  if(duplicate)return reply.code(409).send({error:'duplicate_submission',message:'相同评估在 30 秒内已提交，请勿重复录入',existingId:duplicate.id,assessment:duplicate});
+  const result=computeAdaptive(id,input);
+  const record:AdaptiveRecord={id:`ADP-${String(adaptiveHistory.length+1).padStart(3,'0')}`,planId:id,inputs:input,thresholds:{coverageFailBelow:COVERAGE_FAIL_BELOW,coverageWarnBelow:COVERAGE_WARN_BELOW,lungV20FailAbove:LUNGV20_FAIL_ABOVE,lungV20WarnAbove:LUNGV20_WARN_ABOVE},...result,createdAt:new Date().toISOString()};
+  adaptiveHistory.unshift(record); // 仅追加
+  audits.unshift({at:record.createdAt,action:'adaptive_assessment_created',planId:id,assessmentId:record.id,recommendation:record.recommendation,inputs:input});
+  return reply.code(201).send(record);
+});
 
 await app.listen({host:'127.0.0.1',port:6202});
